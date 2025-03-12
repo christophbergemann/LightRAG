@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from functools import partial
 from typing import Any, AsyncIterator, Callable, Iterator, cast, final
+from opentelemetry.sdk.trace import Tracer
 
 from lightrag.kg import (
     STORAGE_ENV_REQUIREMENTS,
@@ -1216,6 +1217,7 @@ class LightRAG:
         query: str,
         param: QueryParam = QueryParam(),
         system_prompt: str | None = None,
+        tracer: Tracer | None = None
     ) -> str | Iterator[str]:
         """
         Perform a sync query.
@@ -1230,13 +1232,14 @@ class LightRAG:
         """
         loop = always_get_an_event_loop()
 
-        return loop.run_until_complete(self.aquery(query, param, system_prompt))  # type: ignore
+        return loop.run_until_complete(self.aquery(query, param, system_prompt, tracer))  # type: ignore
 
     async def aquery(
         self,
         query: str,
         param: QueryParam = QueryParam(),
         system_prompt: str | None = None,
+        tracer: Tracer | None = None
     ) -> str | AsyncIterator[str]:
         """
         Perform a async query.
@@ -1260,6 +1263,7 @@ class LightRAG:
                 asdict(self),
                 hashing_kv=self.llm_response_cache,  # Directly use llm_response_cache
                 system_prompt=system_prompt,
+                tracer=tracer,
             )
         elif param.mode == "naive":
             response = await naive_query(
@@ -1270,6 +1274,7 @@ class LightRAG:
                 asdict(self),
                 hashing_kv=self.llm_response_cache,  # Directly use llm_response_cache
                 system_prompt=system_prompt,
+                tracer=tracer,
             )
         elif param.mode == "mix":
             response = await mix_kg_vector_query(
@@ -1283,6 +1288,7 @@ class LightRAG:
                 asdict(self),
                 hashing_kv=self.llm_response_cache,  # Directly use llm_response_cache
                 system_prompt=system_prompt,
+                tracer=tracer,
             )
         else:
             raise ValueError(f"Unknown mode {param.mode}")

@@ -13,5 +13,7 @@ tenacity
 
 # LLM packages
 tiktoken
+opentelemetry-sdk
+openinference-semantic-conventions
 
 # Extra libraries are installed when needed using pipmaster

@@ -6,6 +6,10 @@ import re
 import os
 from typing import Any, AsyncIterator
 from collections import Counter, defaultdict
+from opentelemetry import trace
+from opentelemetry.sdk.trace import Tracer
+from openinference.semconv.trace import SpanAttributes
+import time
 
 from .utils import (
     logger,
@@ -672,6 +676,7 @@ async def kg_query(
     global_config: dict[str, str],
     hashing_kv: BaseKVStorage | None = None,
     system_prompt: str | None = None,
+    tracer: Tracer | None = None,
 ) -> str | AsyncIterator[str]:
     # Handle cache
     use_model_func = global_config["llm_model_func"]
@@ -885,6 +890,7 @@ async def mix_kg_vector_query(
     global_config: dict[str, str],
     hashing_kv: BaseKVStorage | None = None,
     system_prompt: str | None = None,
+    tracer: Tracer | None = None,
 ) -> str | AsyncIterator[str]:
     """
     Hybrid retrieval implementation combining knowledge graph and vector search.
@@ -895,190 +901,220 @@ async def mix_kg_vector_query(
     3. Combining both results for comprehensive answer generation
     """
     # 1. Cache handling
-    use_model_func = global_config["llm_model_func"]
-    args_hash = compute_args_hash("mix", query, cache_type="query")
-    cached_response, quantized, min_val, max_val = await handle_cache(
-        hashing_kv, args_hash, query, "mix", cache_type="query"
-    )
-    if cached_response is not None:
-        return cached_response
+    with tracer.start_as_current_span("mix_kg_vector_query") as span:
+        span.set_attribute(SpanAttributes.INPUT_VALUE, query)
+        use_model_func = global_config["llm_model_func"]
+        args_hash = compute_args_hash("mix", query, cache_type="query")
+        cached_response, quantized, min_val, max_val = await handle_cache(
+            hashing_kv, args_hash, query, "mix", cache_type="query"
+        )
+        if cached_response is not None:
+            span.set_attribute(SpanAttributes.OUTPUT_VALUE, cached_response)
+            span.set_status(trace.StatusCode.OK)            
+            return cached_response
 
-    # Process conversation history
-    history_context = ""
-    if query_param.conversation_history:
-        history_context = get_conversation_turns(
-            query_param.conversation_history, query_param.history_turns
+        # Process conversation history
+        history_context = ""
+        if query_param.conversation_history:
+            history_context = get_conversation_turns(
+                query_param.conversation_history, query_param.history_turns
+            )
+
+        # 2. Execute knowledge graph and vector searches in parallel
+        async def get_kg_context():
+            with tracer.start_as_current_span("kg_context") as kg_span:
+                try:
+                    kg_span.set_attribute(SpanAttributes.INPUT_VALUE, query)
+                    # Extract keywords using extract_keywords_only function which already supports conversation history
+                    hl_keywords, ll_keywords = await extract_keywords_only(
+                        query, query_param, global_config, hashing_kv
+                    )
+
+                    if not hl_keywords and not ll_keywords:
+                        logger.warning("Both high-level and low-level keywords are empty")
+                        kg_span.set_status(trace.StatusCode.OK)
+                        kg_span.set_attribute(SpanAttributes.OUTPUT_VALUE, "")
+                        return None
+
+                    # Convert keyword lists to strings
+                    ll_keywords_str = ", ".join(ll_keywords) if ll_keywords else ""
+                    hl_keywords_str = ", ".join(hl_keywords) if hl_keywords else ""
+
+                    # Set query mode based on available keywords
+                    if not ll_keywords_str and not hl_keywords_str:
+                        kg_span.set_status(trace.StatusCode.OK)
+                        kg_span.set_attribute(SpanAttributes.OUTPUT_VALUE, "")
+                        return None
+                    elif not ll_keywords_str:
+                        query_param.mode = "global"
+                    elif not hl_keywords_str:
+                        query_param.mode = "local"
+                    else:
+                        query_param.mode = "hybrid"
+
+                    # Build knowledge graph context
+                    context = await _build_query_context(
+                        ll_keywords_str,
+                        hl_keywords_str,
+                        knowledge_graph_inst,
+                        entities_vdb,
+                        relationships_vdb,
+                        text_chunks_db,
+                        query_param,
+                    )
+
+                    kg_span.set_status(trace.StatusCode.OK)
+                    kg_span.set_attribute(SpanAttributes.OUTPUT_VALUE, context)
+
+                    return context
+
+                except Exception as e:
+                    logger.error(f"Error in get_kg_context: {str(e)}")
+                    kg_span.set_status(trace.StatusCode.ERROR)
+                    return None
+
+        async def get_vector_context():
+            # Consider conversation history in vector search
+            augmented_query = query
+            if history_context:
+                augmented_query = f"{history_context}\n{query}"
+
+            with tracer.start_as_current_span("vector_context") as doc_span:
+                try:
+                # Reduce top_k for vector search in hybrid mode since we have structured information from KG
+                # TODO: add ids to the query
+                    mix_topk = min(10, query_param.top_k)
+                    doc_span.set_attribute(SpanAttributes.INPUT_VALUE, augmented_query)
+                    start_search = time.time()
+                    results = await chunks_vdb.query(
+                        augmented_query, top_k=mix_topk, ids=query_param.ids
+                    )
+                    latency = time.time() - start_search
+                    doc_span.set_attribute("latency.ms", latency*1000)
+                    if not results:
+                        return None
+
+                    chunks_ids = [r["id"] for r in results]
+                    chunks = await text_chunks_db.get_by_ids(chunks_ids)
+
+                    valid_chunks = []
+                    for chunk, result in zip(chunks, results):
+                        if chunk is not None and "content" in chunk:
+                            # Merge chunk content and time metadata
+                                chunk_with_time = {
+                                    "content": chunk["content"],
+                                    "created_at": result.get("created_at", None),
+                                    "id": chunk["id"],
+                                }
+                                valid_chunks.append(chunk_with_time)
+
+                    if valid_chunks:
+                        doc_span.set_attribute(SpanAttributes.RETRIEVAL_DOCUMENTS, [{"document.id": c["id"], "document.content": c["content"]} for c in valid_chunks])
+                    if not valid_chunks:
+                        doc_span.set_attribute(SpanAttributes.OUTPUT_VALUE, "")
+                        doc_span.set_status(trace.StatusCode.OK)
+                        return None
+
+                    maybe_trun_chunks = truncate_list_by_token_size(
+                        valid_chunks,
+                        key=lambda x: x["content"],
+                        max_token_size=query_param.max_token_for_text_unit,
+                    )
+
+                    if not maybe_trun_chunks:
+                        doc_span.set_attribute(SpanAttributes.OUTPUT_VALUE, "")
+                        doc_span.set_status(trace.StatusCode.OK)
+                        return None
+
+                    # Include time information in content
+                    formatted_chunks = []
+                    for c in maybe_trun_chunks:
+                        chunk_text = c["content"]
+                        if c["created_at"]:
+                            chunk_text = f"[Created at: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(c['created_at']))}]\n{chunk_text}"
+                        formatted_chunks.append(chunk_text)
+
+                    logger.debug(
+                        f"Truncate chunks from {len(chunks)} to {len(formatted_chunks)} (max tokens:{query_param.max_token_for_text_unit})"
+                    )
+                    output="\n--New Chunk--\n".join(formatted_chunks)
+                    doc_span.set_attribute(SpanAttributes.OUTPUT_VALUE, output)
+                    doc_span.set_status(trace.StatusCode.OK)
+                    return output
+                except Exception as e:
+                    logger.error(f"Error in get_vector_context: {e}")
+                    doc_span.set_status(trace.StatusCode.ERROR)
+                    return None
+
+        # 3. Execute both retrievals in parallel
+        kg_context, vector_context = await asyncio.gather(
+            get_kg_context(), get_vector_context()
         )
 
-    # 2. Execute knowledge graph and vector searches in parallel
-    async def get_kg_context():
-        try:
-            # Extract keywords using extract_keywords_only function which already supports conversation history
-            hl_keywords, ll_keywords = await extract_keywords_only(
-                query, query_param, global_config, hashing_kv
+        # 4. Merge contexts
+        if kg_context is None and vector_context is None:
+            return PROMPTS["fail_response"]
+
+        if query_param.only_need_context:
+            return {"kg_context": kg_context, "vector_context": vector_context}
+
+        # 5. Construct hybrid prompt
+        sys_prompt = (
+            system_prompt
+            if system_prompt
+            else PROMPTS["mix_rag_response"].format(
+                kg_context=kg_context
+                if kg_context
+                else "No relevant knowledge graph information found",
+                vector_context=vector_context
+                if vector_context
+                else "No relevant text information found",
+                response_type=query_param.response_type,
+                history=history_context,
             )
-
-            if not hl_keywords and not ll_keywords:
-                logger.warning("Both high-level and low-level keywords are empty")
-                return None
-
-            # Convert keyword lists to strings
-            ll_keywords_str = ", ".join(ll_keywords) if ll_keywords else ""
-            hl_keywords_str = ", ".join(hl_keywords) if hl_keywords else ""
-
-            # Set query mode based on available keywords
-            if not ll_keywords_str and not hl_keywords_str:
-                return None
-            elif not ll_keywords_str:
-                query_param.mode = "global"
-            elif not hl_keywords_str:
-                query_param.mode = "local"
-            else:
-                query_param.mode = "hybrid"
-
-            # Build knowledge graph context
-            context = await _build_query_context(
-                ll_keywords_str,
-                hl_keywords_str,
-                knowledge_graph_inst,
-                entities_vdb,
-                relationships_vdb,
-                text_chunks_db,
-                query_param,
-            )
-
-            return context
-
-        except Exception as e:
-            logger.error(f"Error in get_kg_context: {str(e)}")
-            return None
-
-    async def get_vector_context():
-        # Consider conversation history in vector search
-        augmented_query = query
-        if history_context:
-            augmented_query = f"{history_context}\n{query}"
-
-        try:
-            # Reduce top_k for vector search in hybrid mode since we have structured information from KG
-            mix_topk = min(10, query_param.top_k)
-            # TODO: add ids to the query
-            results = await chunks_vdb.query(
-                augmented_query, top_k=mix_topk, ids=query_param.ids
-            )
-            if not results:
-                return None
-
-            chunks_ids = [r["id"] for r in results]
-            chunks = await text_chunks_db.get_by_ids(chunks_ids)
-
-            valid_chunks = []
-            for chunk, result in zip(chunks, results):
-                if chunk is not None and "content" in chunk:
-                    # Merge chunk content and time metadata
-                    chunk_with_time = {
-                        "content": chunk["content"],
-                        "created_at": result.get("created_at", None),
-                    }
-                    valid_chunks.append(chunk_with_time)
-
-            if not valid_chunks:
-                return None
-
-            maybe_trun_chunks = truncate_list_by_token_size(
-                valid_chunks,
-                key=lambda x: x["content"],
-                max_token_size=query_param.max_token_for_text_unit,
-            )
-
-            if not maybe_trun_chunks:
-                return None
-
-            # Include time information in content
-            formatted_chunks = []
-            for c in maybe_trun_chunks:
-                chunk_text = c["content"]
-                if c["created_at"]:
-                    chunk_text = f"[Created at: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(c['created_at']))}]\n{chunk_text}"
-                formatted_chunks.append(chunk_text)
-
-            logger.debug(
-                f"Truncate chunks from {len(chunks)} to {len(formatted_chunks)} (max tokens:{query_param.max_token_for_text_unit})"
-            )
-            return "\n--New Chunk--\n".join(formatted_chunks)
-        except Exception as e:
-            logger.error(f"Error in get_vector_context: {e}")
-            return None
-
-    # 3. Execute both retrievals in parallel
-    kg_context, vector_context = await asyncio.gather(
-        get_kg_context(), get_vector_context()
-    )
-
-    # 4. Merge contexts
-    if kg_context is None and vector_context is None:
-        return PROMPTS["fail_response"]
-
-    if query_param.only_need_context:
-        return {"kg_context": kg_context, "vector_context": vector_context}
-
-    # 5. Construct hybrid prompt
-    sys_prompt = (
-        system_prompt
-        if system_prompt
-        else PROMPTS["mix_rag_response"].format(
-            kg_context=kg_context
-            if kg_context
-            else "No relevant knowledge graph information found",
-            vector_context=vector_context
-            if vector_context
-            else "No relevant text information found",
-            response_type=query_param.response_type,
-            history=history_context,
-        )
-    )
-
-    if query_param.only_need_prompt:
-        return sys_prompt
-
-    len_of_prompts = len(encode_string_by_tiktoken(query + sys_prompt))
-    logger.debug(f"[mix_kg_vector_query]Prompt Tokens: {len_of_prompts}")
-
-    # 6. Generate response
-    response = await use_model_func(
-        query,
-        system_prompt=sys_prompt,
-        stream=query_param.stream,
-    )
-
-    # Clean up response content
-    if isinstance(response, str) and len(response) > len(sys_prompt):
-        response = (
-            response.replace(sys_prompt, "")
-            .replace("user", "")
-            .replace("model", "")
-            .replace(query, "")
-            .replace("<system>", "")
-            .replace("</system>", "")
-            .strip()
         )
 
-        # 7. Save cache - Only cache after collecting complete response
-        await save_to_cache(
-            hashing_kv,
-            CacheData(
-                args_hash=args_hash,
-                content=response,
-                prompt=query,
-                quantized=quantized,
-                min_val=min_val,
-                max_val=max_val,
-                mode="mix",
-                cache_type="query",
-            ),
+        if query_param.only_need_prompt:
+            return sys_prompt
+
+        len_of_prompts = len(encode_string_by_tiktoken(query + sys_prompt))
+        logger.debug(f"[mix_kg_vector_query]Prompt Tokens: {len_of_prompts}")
+
+        # 6. Generate response
+        response = await use_model_func(
+            query,
+            system_prompt=sys_prompt,
+            stream=query_param.stream,
         )
 
-    return response
+        # Clean up response content
+        if isinstance(response, str) and len(response) > len(sys_prompt):
+            response = (
+                response.replace(sys_prompt, "")
+                .replace("user", "")
+                .replace("model", "")
+                .replace(query, "")
+                .replace("<system>", "")
+                .replace("</system>", "")
+                .strip()
+            )
+
+            # 7. Save cache - Only cache after collecting complete response
+            await save_to_cache(
+                hashing_kv,
+                CacheData(
+                    args_hash=args_hash,
+                    content=response,
+                    prompt=query,
+                    quantized=quantized,
+                    min_val=min_val,
+                    max_val=max_val,
+                    mode="mix",
+                    cache_type="query",
+                ),
+            )
+
+        return response
 
 
 async def _build_query_context(
@@ -1673,6 +1709,7 @@ async def naive_query(
     global_config: dict[str, str],
     hashing_kv: BaseKVStorage | None = None,
     system_prompt: str | None = None,
+    tracer: Tracer | None = None,
 ) -> str | AsyncIterator[str]:
     # Handle cache
     use_model_func = global_config["llm_model_func"]
