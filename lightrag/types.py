@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel
 from typing import Any, Optional
+import datetime
 
 
 class GPTKeywordExtractionFormat(BaseModel):
@@ -28,6 +29,11 @@ class KnowledgeGraph(BaseModel):
     edges: list[KnowledgeGraphEdge] = []
 
 
+class VectorChunk(BaseModel):
+    id: str
+    created_at: Optional[datetime.datetime]
+    content: str
+
 class RAGResponse(BaseModel):
     response: Optional[str]
-    vector_chunks: Optional[list[dict[str, str]]]
+    vector_chunks: Optional[list[VectorChunk]]

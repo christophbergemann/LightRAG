@@ -37,7 +37,7 @@ from .operate import (
     query_with_keywords,
 )
 from .prompt import GRAPH_FIELD_SEP, PROMPTS
-from .types import RAGResponse
+from .types import RAGResponse, VectorChunk
 from .utils import (
     EmbeddingFunc,
     always_get_an_event_loop,

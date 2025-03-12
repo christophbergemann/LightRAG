@@ -39,7 +39,7 @@ from .base import (
     QueryParam,
 )
 from .prompt import GRAPH_FIELD_SEP, PROMPTS
-from .types import RAGResponse
+from .types import RAGResponse, VectorChunk
 import time
 from dotenv import load_dotenv
 
@@ -998,27 +998,27 @@ async def mix_kg_vector_query(
                     chunks_ids = [r["id"] for r in results]
                     chunks = await text_chunks_db.get_by_ids(chunks_ids)
 
-                    valid_chunks = []
+                    valid_chunks:list[VectorChunk] = []
                     for chunk, result in zip(chunks, results):
                         if chunk is not None and "content" in chunk:
                             # Merge chunk content and time metadata
-                                chunk_with_time = {
-                                    "content": chunk["content"],
-                                    "created_at": result.get("created_at", None),
-                                    "id": chunk["id"],
-                                }
+                                chunk_with_time = VectorChunk(
+                                    id=chunk["id"],
+                                    content=chunk["content"],
+                                    created_at=result.get("created_at", None),
+                                )
                                 valid_chunks.append(chunk_with_time)
 
                     if valid_chunks:
                         for i,entry in enumerate(valid_chunks):                            
-                            doc_span.set_attribute(f"{SpanAttributes.RETRIEVAL_DOCUMENTS}.{i}.id",entry["id"]) 
-                            doc_span.set_attribute(f"{SpanAttributes.RETRIEVAL_DOCUMENTS}.{i}.content",entry["content"])
+                            doc_span.set_attribute(f"{SpanAttributes.RETRIEVAL_DOCUMENTS}.{i}.id",entry.id) 
+                            doc_span.set_attribute(f"{SpanAttributes.RETRIEVAL_DOCUMENTS}.{i}.content",entry.content)
                     if not valid_chunks:
                         doc_span.set_attribute(SpanAttributes.OUTPUT_VALUE, "")
                         doc_span.set_status(trace.StatusCode.OK)
                         return None, None
 
-                    maybe_trun_chunks = truncate_list_by_token_size(
+                    maybe_trun_chunks:list[VectorChunk] = truncate_list_by_token_size(
                         valid_chunks,
                         key=lambda x: x["content"],
                         max_token_size=query_param.max_token_for_text_unit,
@@ -1032,9 +1032,9 @@ async def mix_kg_vector_query(
                     # Include time information in content
                     formatted_chunks = []
                     for c in maybe_trun_chunks:
-                        chunk_text = c["content"]
-                        if c["created_at"]:
-                            chunk_text = f"[Created at: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(c['created_at']))}]\n{chunk_text}"
+                        chunk_text = c.content
+                        if c.created_at:
+                            chunk_text = f"[Created at: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(c.created_at))}]\n{chunk_text}"
                         formatted_chunks.append(chunk_text)
 
                     logger.debug(
