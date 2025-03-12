@@ -1009,7 +1009,9 @@ async def mix_kg_vector_query(
                                 valid_chunks.append(chunk_with_time)
 
                     if valid_chunks:
-                        doc_span.set_attribute(SpanAttributes.RETRIEVAL_DOCUMENTS, [{"document.id": c["id"], "document.content": c["content"]} for c in valid_chunks])
+                        for i,entry in enumerate(valid_chunks):                            
+                            doc_span.set_attribute(f"{SpanAttributes.RETRIEVAL_DOCUMENTS}.{i}.id",entry["id"]) 
+                            doc_span.set_attribute(f"{SpanAttributes.RETRIEVAL_DOCUMENTS}.{i}.content",entry["content"])
                     if not valid_chunks:
                         doc_span.set_attribute(SpanAttributes.OUTPUT_VALUE, "")
                         doc_span.set_status(trace.StatusCode.OK)
