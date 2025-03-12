@@ -10,6 +10,7 @@ from opentelemetry import trace
 from opentelemetry.sdk.trace import Tracer
 from openinference.semconv.trace import SpanAttributes
 import time
+import traceback
 
 from .utils import (
     logger,
@@ -1017,10 +1018,10 @@ async def mix_kg_vector_query(
                         doc_span.set_attribute(SpanAttributes.OUTPUT_VALUE, "")
                         doc_span.set_status(trace.StatusCode.OK)
                         return None, None
-
+                    
                     maybe_trun_chunks:list[VectorChunk] = truncate_list_by_token_size(
                         valid_chunks,
-                        key=lambda x: x["content"],
+                        key=lambda x: x.content,
                         max_token_size=query_param.max_token_for_text_unit,
                     )
 
@@ -1045,7 +1046,7 @@ async def mix_kg_vector_query(
                     doc_span.set_status(trace.StatusCode.OK)
                     return output, maybe_trun_chunks
                 except Exception as e:
-                    logger.error(f"Error in get_vector_context: {e}")
+                    logger.error(f"Error in get_vector_context: {e}, {traceback.format_exc()}")
                     doc_span.set_status(trace.StatusCode.ERROR)
                     return None, None
 
