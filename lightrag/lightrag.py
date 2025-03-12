@@ -37,6 +37,7 @@ from .operate import (
     query_with_keywords,
 )
 from .prompt import GRAPH_FIELD_SEP, PROMPTS
+from .types import RAGResponse
 from .utils import (
     EmbeddingFunc,
     always_get_an_event_loop,
@@ -1218,7 +1219,7 @@ class LightRAG:
         param: QueryParam = QueryParam(),
         system_prompt: str | None = None,
         tracer: Tracer | None = None
-    ) -> str | Iterator[str]:
+    ) -> RAGResponse | Iterator[RAGResponse]:
         """
         Perform a sync query.
 
@@ -1240,7 +1241,7 @@ class LightRAG:
         param: QueryParam = QueryParam(),
         system_prompt: str | None = None,
         tracer: Tracer | None = None
-    ) -> str | AsyncIterator[str]:
+    ) -> RAGResponse | AsyncIterator[RAGResponse]:
         """
         Perform a async query.
 
@@ -1253,7 +1254,7 @@ class LightRAG:
             str: The result of the query execution.
         """
         if param.mode in ["local", "global", "hybrid"]:
-            response = await kg_query(
+            rag_output = await kg_query(
                 query.strip(),
                 self.chunk_entity_relation_graph,
                 self.entities_vdb,
@@ -1265,8 +1266,9 @@ class LightRAG:
                 system_prompt=system_prompt,
                 tracer=tracer,
             )
+            response = RAGResponse(response=rag_output)
         elif param.mode == "naive":
-            response = await naive_query(
+            rag_output = await naive_query(
                 query.strip(),
                 self.chunks_vdb,
                 self.text_chunks,
@@ -1276,6 +1278,7 @@ class LightRAG:
                 system_prompt=system_prompt,
                 tracer=tracer,
             )
+            response = RAGResponse(response=rag_output)
         elif param.mode == "mix":
             response = await mix_kg_vector_query(
                 query.strip(),

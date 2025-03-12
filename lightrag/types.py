@@ -26,3 +26,8 @@ class KnowledgeGraphEdge(BaseModel):
 class KnowledgeGraph(BaseModel):
     nodes: list[KnowledgeGraphNode] = []
     edges: list[KnowledgeGraphEdge] = []
+
+
+class RAGResponse(BaseModel):
+    response: Optional[str]
+    vector_chunks: Optional[list[dict[str, str]]]

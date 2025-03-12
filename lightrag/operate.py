@@ -39,6 +39,7 @@ from .base import (
     QueryParam,
 )
 from .prompt import GRAPH_FIELD_SEP, PROMPTS
+from .types import RAGResponse
 import time
 from dotenv import load_dotenv
 
@@ -891,7 +892,7 @@ async def mix_kg_vector_query(
     hashing_kv: BaseKVStorage | None = None,
     system_prompt: str | None = None,
     tracer: Tracer | None = None,
-) -> str | AsyncIterator[str]:
+) -> RAGResponse | AsyncIterator[RAGResponse]:
     """
     Hybrid retrieval implementation combining knowledge graph and vector search.
 
@@ -992,7 +993,7 @@ async def mix_kg_vector_query(
                     latency = time.time() - start_search
                     doc_span.set_attribute("latency.ms", latency*1000)
                     if not results:
-                        return None
+                        return None, None
 
                     chunks_ids = [r["id"] for r in results]
                     chunks = await text_chunks_db.get_by_ids(chunks_ids)
@@ -1015,7 +1016,7 @@ async def mix_kg_vector_query(
                     if not valid_chunks:
                         doc_span.set_attribute(SpanAttributes.OUTPUT_VALUE, "")
                         doc_span.set_status(trace.StatusCode.OK)
-                        return None
+                        return None, None
 
                     maybe_trun_chunks = truncate_list_by_token_size(
                         valid_chunks,
@@ -1026,7 +1027,7 @@ async def mix_kg_vector_query(
                     if not maybe_trun_chunks:
                         doc_span.set_attribute(SpanAttributes.OUTPUT_VALUE, "")
                         doc_span.set_status(trace.StatusCode.OK)
-                        return None
+                        return None, None
 
                     # Include time information in content
                     formatted_chunks = []
@@ -1042,14 +1043,14 @@ async def mix_kg_vector_query(
                     output="\n--New Chunk--\n".join(formatted_chunks)
                     doc_span.set_attribute(SpanAttributes.OUTPUT_VALUE, output)
                     doc_span.set_status(trace.StatusCode.OK)
-                    return output
+                    return output, maybe_trun_chunks
                 except Exception as e:
                     logger.error(f"Error in get_vector_context: {e}")
                     doc_span.set_status(trace.StatusCode.ERROR)
-                    return None
+                    return None, None
 
         # 3. Execute both retrievals in parallel
-        kg_context, vector_context = await asyncio.gather(
+        kg_context, (vector_context, vector_chunks) = await asyncio.gather(
             get_kg_context(), get_vector_context()
         )
 
@@ -1116,7 +1117,7 @@ async def mix_kg_vector_query(
                 ),
             )
 
-        return response
+        return RAGResponse(response=response, vector_chunks=vector_chunks)
 
 
 async def _build_query_context(
