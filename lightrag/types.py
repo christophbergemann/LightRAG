@@ -37,3 +37,4 @@ class VectorChunk(BaseModel):
 class RAGResponse(BaseModel):
     response: Optional[str]
     vector_chunks: Optional[list[VectorChunk]]
+    graph_context: Optional[str]

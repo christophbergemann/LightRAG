@@ -910,10 +910,12 @@ async def mix_kg_vector_query(
         cached_response, quantized, min_val, max_val = await handle_cache(
             hashing_kv, args_hash, query, "mix", cache_type="query"
         )
-        if cached_response is not None:
-            span.set_attribute(SpanAttributes.OUTPUT_VALUE, cached_response)
-            span.set_status(trace.StatusCode.OK)            
-            return cached_response
+
+        # TODO: Fix caching of non-string return values (i.e. vector and graph information)
+        # if cached_response is not None:
+        #     span.set_attribute(SpanAttributes.OUTPUT_VALUE, cached_response)
+        #     span.set_status(trace.StatusCode.OK)
+        #     return cached_response
 
         # Process conversation history
         history_context = ""
@@ -923,7 +925,7 @@ async def mix_kg_vector_query(
             )
 
         # 2. Execute knowledge graph and vector searches in parallel
-        async def get_kg_context():
+        async def get_kg_context()->str | None:
             with tracer.start_as_current_span("kg_context") as kg_span:
                 try:
                     kg_span.set_attribute(SpanAttributes.INPUT_VALUE, query)
@@ -1118,7 +1120,7 @@ async def mix_kg_vector_query(
                 ),
             )
 
-        return RAGResponse(response=response, vector_chunks=vector_chunks)
+        return RAGResponse(response=response, vector_chunks=vector_chunks, graph_context=kg_context)
 
 
 async def _build_query_context(
